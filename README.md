@@ -16,7 +16,10 @@ Section numbers (§) refer to the course notes on Mixture-of-Experts that this w
 |---|---|
 | `moe_upcycling_run.ipynb` | The executed Colab notebook (T4 GPU), with every output and chart |
 | `moe_upcycling.ipynb` | The same notebook without outputs, ready to re-run |
-| `experiments.csv`, `experiments.png` | Results of the nine comparison experiments (section 11 of the notebook) |
+| `experiments.csv`, `experiments.png` | Results of the nine comparison experiments (section 11 of the notebook), one run each |
+| `moe_seeds.ipynb` | Repeats the nine experiments with 3 seeds each and tests which differences are real |
+| `seeds_runs.csv` | One row per seeded run (30 runs: 9 variants + the dense control, × 3 seeds) |
+| `seeds_summary.csv`, `seeds_verdicts.csv`, `seeds_results.png` | Mean ± spread across seeds, the significance tests, and the chart |
 | `main_loss.png`, `main_expert_load.png`, `main_maxvio.png` | Charts from the main run |
 | `dense.pt`, `moe.pt` | Checkpoints: the dense model at conversion, and the final MoE |
 | `tinystories_valid.txt` | The training text. Not stored in the repo; the notebook downloads it automatically |
@@ -118,6 +121,8 @@ Nine variants, each converted from the **same trained dense model** and trained 
 
 ### Findings
 
+These come from one run per variant. The section after them repeats every experiment with 3 seeds and confirms or corrects each one.
+
 **Balancing (§10, §12, §13): the clearest result.** Without balancing, MaxVio climbed to about 0.9 (the busiest expert received nearly twice the average load), and up to 2 experts died. The auxiliary loss held MaxVio at 0.04–0.08, and the loss-free bias at about 0.01, 4–8× tighter than the auxiliary loss. Validation loss was the same in all three runs (0.7725–0.7727), so at this scale imbalance doesn't yet cost quality. Its cost would appear as uneven GPU load under expert parallelism (§10, §16). One detail: without balancing, MaxVio stayed near 0 until step 2,700 and then jumped. That is exactly when probabilistic top-k ended, so the sampled routing had been hiding the imbalance.
 
 **Shared expert (§8): clearly helps.** Without a shared expert, every expert is a full-width copy with half its neurons redrawn, so the conversion jump was 5× bigger (+0.283 vs +0.055). That run also finished worst (0.7803), even though it uses *more* active parameters (5.85M vs 4.67M). This matches DeepSeekMoE's result in §8, where removing the shared expert raised the loss.
@@ -130,9 +135,49 @@ Nine variants, each converted from the **same trained dense model** and trained 
 
 **Granularity (§8).** At the same active size (3.5M), 16 experts with top-4 did worse than 8 experts with top-2 (0.7799 vs 0.7744) and had a larger jump (+0.095 vs +0.059). Quarter-width experts each keep less of the dense network when it is cut up. The advantage of finer experts reported in §8 comes from training at far larger scale than 1,000 steps on a 3.5M-parameter model.
 
+### Repeated with 3 seeds
+
+Every experiment was run again with **3 seeds** (`moe_seeds.ipynb`), all starting from the same `dense.pt`. A seed changes which neurons are redrawn, the router's starting weights, the probabilistic routing samples and the order of training batches.
+
+**How differences were tested.** Within one seed, every variant and the dense control train on the *same batches*, so each comparison is **paired by seed**: take the per-seed difference, then run a paired t-test across the 3 seeds. A difference is called **real** when p < 0.05.
+
+![Final loss relative to the dense model, and final MaxVio, for each seed](seeds_results.png)
+
+| Variant | Final val loss (mean ± sd) | vs dense continued (paired) | Real? | MaxVio final | Effective experts | Dead experts (peak) |
+|---|---|---|---|---|---|---|
+| dense, continued | 0.7639 ± 0.0002 | — | — | — | — | — |
+| **copy, hard top-k** | **0.7585 ± 0.0002** | **−0.0054 ± 0.0002** | **yes** (p = 0.001) | 0.006 | 8.00 of 8 | 0 |
+| **copy** | **0.7600 ± 0.0007** | **−0.0039 ± 0.0006** | **yes** (p = 0.007) | 0.006 | 8.00 of 8 | 0 |
+| softmax router | 0.7718 ± 0.0005 | +0.0079 ± 0.0003 | yes (p = 0.001) | 0.006 | 8.00 of 8 | 0 |
+| aux loss | 0.7722 ± 0.0004 | +0.0083 ± 0.0002 | yes (p < 0.001) | 0.056 | 8.00 of 8 | 0 |
+| no balancing | 0.7722 ± 0.0006 | +0.0083 ± 0.0004 | yes (p = 0.001) | **0.82 ± 0.16** | **6.80 of 8** | **0–3** |
+| drop (baseline) | 0.7724 ± 0.0009 | +0.0085 ± 0.0007 | yes (p = 0.003) | 0.005 | 8.00 of 8 | 0 |
+| partition | 0.7744 ± 0.0001 | +0.0105 ± 0.0002 | yes (p < 0.001) | 0.004 | 8.00 of 8 | 0 |
+| no shared expert | 0.7786 ± 0.0004 | +0.0147 ± 0.0002 | yes (p < 0.001) | 0.005 | 8.00 of 8 | 0 |
+| 16 experts, top-4 | 0.7792 ± 0.0006 | +0.0153 ± 0.0004 | yes (p < 0.001) | 0.006 | 16.00 of 16 | 0 |
+
+Effective experts and MaxVio here are measured over the last 100 training steps (about 820k routing decisions per layer), so they read more even than the validation-batch figures in the router section above.
+
+**The biggest surprise: the noise is much smaller than assumed.** Seed-to-seed spread in final loss is only ±0.0002 to ±0.0009. The single-run write-up assumed differences under 0.005 were noise. In fact differences of about 0.002 and above are measurable.
+
+**What held up, and what changed:**
+
+| Comparison | Difference (paired, mean ± sd) | Verdict | What it means |
+|---|---|---|---|
+| copy vs dense continued | −0.0039 ± 0.0006 | **real** | Upcycling by plain copying **beats the dense model** after 1,000 steps, for 1.3× the compute per token. The single run hinted at this; the seeds confirm it. |
+| copy vs drop (baseline) | −0.0125 ± 0.0005 | **real** | Redrawing half the neurons costs about 0.0125 at 1,000 steps. At this scale, copying is the better way to grow. |
+| copy, hard top-k vs copy | −0.0014 ± 0.0006 | within noise (p = 0.059) | Hard top-k from step 0 did no harm; there was no clone collapse with 8 experts. It may even help slightly, but 3 seeds can't confirm that. |
+| no balancing vs baseline: MaxVio | +0.81 ± 0.16 | **real** | Without balancing, routing goes lopsided in every seed: effective experts drop from 8.00 to 6.80, and up to 3 experts die. |
+| no balancing vs baseline: loss | −0.0002 ± 0.0003 | within noise | …but at this scale, the imbalance doesn't yet hurt loss. |
+| aux loss vs baseline: MaxVio | +0.050 ± 0.008 | **real** | The loss-free bias balances about 10× more tightly than the auxiliary loss (0.005 vs 0.056), with no difference in loss (within noise). |
+| softmax vs sigmoid | loss −0.0006 ± 0.0005, MaxVio +0.0007 ± 0.0013 | within noise | Confirmed: the score function makes no measurable difference here. |
+| no shared expert vs baseline | +0.0062 ± 0.0006 | **real** | Confirmed: the shared expert helps, despite using fewer active parameters. Its conversion jump is also 5× larger (+0.27 vs +0.055). |
+| partition vs drop | +0.0019 ± 0.0009 | within noise (p = 0.072) | The two ways of making experts different end about level; partition has a slightly larger jump (+0.061 vs +0.055, real). |
+| 16 experts top-4 vs 8 experts top-2 (both partition, same active size) | +0.0049 ± 0.0006 | **real** | Confirmed: finer experts do worse at this scale and training length, starting with a larger jump (+0.105 vs +0.061). |
+
 ### Limits
 
-- Each variant ran once with one seed, so final-loss differences under about 0.005 (copy vs hard top-k, softmax vs sigmoid, drop vs auxiliary loss) are within noise. The balancing and shared-expert results are well beyond that.
+- Each variant has 3 seeds. That is enough to detect differences of about 0.002 in final loss, but smaller effects (such as hard top-k vs copy) can't be confirmed either way.
 - The experiments ran for 1,000 steps; the main run for 2,000. Variants with a larger conversion jump hadn't finished recovering.
 - The model is tiny (3.5M dense parameters) and character-level, so these results describe the mechanics of conversion, not how a large MoE would behave.
 
@@ -144,21 +189,11 @@ Each step follows from something seen in these results.
 
 | Next step | Why | Feasible on a free Colab T4? |
 |---|---|---|
-| **Repeat each experiment with 3 seeds** and report mean ± spread | Many differences between variants were under 0.005, which is within single-run noise. Repeats would show which results are real. | Yes. Triples the run time (about 1.5 hours for all 9 variants) |
+| ~~Repeat each experiment with 3 seeds~~ **Done** | See "Repeated with 3 seeds" above. Took about 70 minutes on a T4, run across several sessions because free Colab disconnected; the notebook resumes where it stopped. | Yes |
 | **64 experts instead of 8** | Clone collapse didn't appear with 8 experts. The course observed it with 460. Testing 64 cloned experts with hard vs probabilistic top-k would show whether it appears as the expert count grows. | Yes, at the current model size, though slower per step |
-| **Sweep the redraw fraction r** (0 to 0.75) | Plain copying beat drop-upcycling (r = 0.5) here, while the course reports r = 0.5 as best at large scale. A sweep would show where redrawing starts to pay off. | Yes |
-| **Train longer** | Drop-upcycling was 0.009 behind dense after 1,000 steps and level after 2,000. Longer training would show whether the MoE moves ahead or stays level. | Yes |
+| **Sweep the redraw fraction r** (0 to 0.75) | Plain copying beat drop-upcycling (r = 0.5) by 0.0125, confirmed across 3 seeds, while the course reports r = 0.5 as best at large scale. A sweep would show how the cost grows with r, and where redrawing starts to pay off. | Yes |
+| **Train longer** | Drop-upcycling was 0.009 behind dense after 1,000 steps and level after 2,000, while plain copying was already 0.004 ahead after 1,000. Longer training would show how far ahead each one ends up. | Yes |
 | **Scale up 10–100×** | The MoE only matched the dense model here. Its advantage, more capacity for little extra compute per token, should appear once capacity becomes the limit. | 10× is borderline (a few hours per run); 100× needs larger GPUs |
-
-### Repeating runs with several seeds
-
-A single run can't separate a real difference from luck: a different random seed changes the starting router weights, which neurons get redrawn, and the order of training batches. The plan:
-
-- Run every variant with **3 seeds** (for example 0, 1 and 2), keeping everything else identical.
-- Report each result as **mean ± standard deviation** across the 3 runs.
-- Treat a difference between two variants as real only if it is **larger than about twice the spread** of either one. Otherwise, report the two as level.
-
-Expected effect: the balancing result (MaxVio 0.01 vs 0.9) and the shared-expert result (+0.28 vs +0.055 jump) should survive easily. Differences under 0.005, such as softmax vs sigmoid or copy vs hard top-k, will probably turn out to be ties.
 
 ### Scaling up
 
